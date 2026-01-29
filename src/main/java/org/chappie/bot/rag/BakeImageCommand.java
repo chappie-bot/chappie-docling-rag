@@ -68,9 +68,9 @@ import org.eclipse.jgit.api.errors.GitAPIException;
     mixinStandardHelpOptions = true,
     description = "Hybrid approach: Clone Quarkus repo for metadata, use Docling for HTML conversion, combine both."
 )
-public class StandaloneBakeImageCommand implements Runnable {
+public class BakeImageCommand implements Runnable {
 
-    private static final Logger LOG = Logger.getLogger(StandaloneBakeImageCommand.class);
+    private static final Logger LOG = Logger.getLogger(BakeImageCommand.class);
     private static final String DB_NAME = "postgres";
     private static final String DOCLING_IMAGE = "ghcr.io/docling-project/docling-serve:v1.10.0";
     private static final int EMBEDDING_DIMENSIONS = 384; // BGE Small EN v15
@@ -94,7 +94,7 @@ public class StandaloneBakeImageCommand implements Runnable {
     @Option(names = "--push",
             description = "Push to remote registry instead of loading to local Docker daemon")
     boolean push;
-
+    
     @Option(names = "--registry-username",
             description = "Registry username (used only with --push)")
     String registryUsername;
@@ -292,13 +292,35 @@ public class StandaloneBakeImageCommand implements Runnable {
 
                     // Build versioned HTML URL
                     String htmlUrl = "https://quarkus.io/version/" + versionForUrl + "/guides/" + title;
-                    metadata.put("url", htmlUrl);
 
                     // Use Docling to fetch and convert HTML from quarkus.io to Markdown
-                    URI htmlUri = URI.create(htmlUrl);
-                    ConvertDocumentResponse resp = doclingService.convertFromUri(htmlUri, OutputFormat.MARKDOWN);
+                    // Try versioned URL first, fallback to latest if it fails
+                    ConvertDocumentResponse resp = null;
+                    String actualUrl = htmlUrl;
+                    try {
+                        URI htmlUri = URI.create(htmlUrl);
+                        resp = doclingService.convertFromUri(htmlUri, OutputFormat.MARKDOWN);
+                        LOG.infof("[bake-image] Fetched versioned URL: %s", htmlUrl);
+                    } catch (Exception e) {
+                        // Fallback to latest (non-versioned) URL
+                        String latestUrl = "https://quarkus.io/guides/" + title;
+                        LOG.warnf("[bake-image] Versioned URL failed (%s), trying latest URL: %s",
+                                  e.getMessage(), latestUrl);
+                        try {
+                            URI latestUri = URI.create(latestUrl);
+                            resp = doclingService.convertFromUri(latestUri, OutputFormat.MARKDOWN);
+                            actualUrl = latestUrl;
+                            LOG.infof("[bake-image] Successfully fetched latest URL: %s", latestUrl);
+                        } catch (Exception fallbackEx) {
+                            // Both URLs failed, re-throw to be caught by outer exception handler
+                            LOG.errorf(fallbackEx, "[bake-image] Both versioned and latest URLs failed for %s", title);
+                            throw fallbackEx;
+                        }
+                    }
+
                     String markdownContent = resp.getDocument().getMarkdownContent();
-                    LOG.infof("[bake-image] Converted %s -> %d chars", htmlUrl, markdownContent.length());
+                    metadata.put("url", actualUrl);
+                    LOG.infof("[bake-image] Converted %s -> %d chars", actualUrl, markdownContent.length());
 
                     // Create document and ingest (using Docling-converted Markdown content + AsciiDoc metadata)
                     Document doc = Document.from(markdownContent, metadata);
