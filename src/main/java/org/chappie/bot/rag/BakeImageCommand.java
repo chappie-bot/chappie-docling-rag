@@ -1,22 +1,29 @@
 package org.chappie.bot.rag;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import javax.sql.DataSource;
 
-import org.eclipse.microprofile.config.Config;
-import org.eclipse.microprofile.config.ConfigProvider;
 import org.jboss.logging.Logger;
 import org.postgresql.ds.PGSimpleDataSource;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
+import com.github.dockerjava.api.model.ExposedPort;
+import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.PortBinding;
+import com.github.dockerjava.api.model.Ports;
 
 import com.google.cloud.tools.jib.api.Containerizer;
 import com.google.cloud.tools.jib.api.DockerDaemonImage;
@@ -27,6 +34,10 @@ import com.google.cloud.tools.jib.api.buildplan.AbsoluteUnixPath;
 import com.google.cloud.tools.jib.api.buildplan.FileEntriesLayer;
 import com.google.cloud.tools.jib.api.buildplan.Platform;
 
+import ai.docling.serve.api.convert.request.options.OutputFormat;
+import ai.docling.serve.api.convert.response.ConvertDocumentResponse;
+import io.quarkiverse.docling.runtime.client.DoclingService;
+import jakarta.inject.Inject;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
@@ -36,31 +47,33 @@ import dev.langchain4j.model.embedding.onnx.bgesmallenv15q.BgeSmallEnV15Quantize
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
 import dev.langchain4j.store.embedding.pgvector.PgVectorEmbeddingStore;
 
-import io.quarkiverse.docling.runtime.client.DoclingService;
-import jakarta.inject.Inject;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.utility.DockerImageName;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.errors.GitAPIException;
+
 /**
- * CLI command to build a pgvector Docker image with Quarkus documentation embeddings
- * using Docling for document processing.
+ * Hybrid approach CLI command to build a pgvector database image with Quarkus documentation.
+ *
+ * 1. Clones Quarkus repository at specific version tag
+ * 2. Extracts rich metadata from AsciiDoc files (topics, categories, extensions, summary)
+ * 3. Fetches HTML guides from quarkus.io at same version
+ * 4. Uses Docling to convert HTML to well-formatted Markdown
+ * 5. Combines Docling content with AsciiDoc metadata
+ * 6. Ingests into pgvector and bakes a Docker image
  */
 @Command(
     name = "bake-image",
     mixinStandardHelpOptions = true,
-    description = "Fetch Quarkus documentation, process with Docling, ingest into pgvector, and bake a Docker image."
+    description = "Hybrid approach: Clone Quarkus repo for metadata, use Docling for HTML conversion, combine both."
 )
 public class BakeImageCommand implements Runnable {
 
     private static final Logger LOG = Logger.getLogger(BakeImageCommand.class);
     private static final String DB_NAME = "postgres";
     private static final String DOCLING_IMAGE = "ghcr.io/docling-project/docling-serve:v1.10.0";
-
-    @Inject
-    DoclingService doclingService;
+    private static final int EMBEDDING_DIMENSIONS = 384; // BGE Small EN v15
 
     @Option(names = "--quarkus-version", required = true,
             description = "Target Quarkus version (e.g., 3.30.6)")
@@ -75,13 +88,13 @@ public class BakeImageCommand implements Runnable {
     int chunkOverlap;
 
     @Option(names = "--semantic",
-            description = "Use semantic chunking (split by Markdown headers) instead of fixed-size chunks")
+            description = "Use semantic chunking (split by AsciiDoc/Markdown headers) instead of fixed-size chunks")
     boolean semanticChunking;
 
     @Option(names = "--push",
             description = "Push to remote registry instead of loading to local Docker daemon")
     boolean push;
-
+    
     @Option(names = "--registry-username",
             description = "Registry username (used only with --push)")
     String registryUsername;
@@ -102,7 +115,11 @@ public class BakeImageCommand implements Runnable {
             description = "Maximum number of guides to process (0 = all, useful for testing)")
     int maxGuides;
 
-    private PostgreSQLContainer<?> container;
+    @Inject
+    DoclingService doclingService;
+
+    private PostgreSQLContainer<?> pgContainer;
+    private GenericContainer<?> doclingContainer;
 
     @Override
     public void run() {
@@ -114,28 +131,42 @@ public class BakeImageCommand implements Runnable {
 
         Path workDir = null;
         try {
-            // 1) Start pgvector container
-            LOG.info("=== Starting pgvector with Testcontainers ===");
-            this.container = new PostgreSQLContainer<>(DockerImageName.parse(this.baseImageRef))
+            // 1) Start Docling Serve container on fixed port 5001
+            LOG.info("=== Starting Docling Serve container ===");
+            this.doclingContainer = new GenericContainer<>(DockerImageName.parse(DOCLING_IMAGE))
+                    .withExposedPorts(5001)
+                    .withCreateContainerCmdModifier(cmd -> {
+                        cmd.withHostConfig(
+                            new HostConfig().withPortBindings(
+                                new PortBinding(Ports.Binding.bindPort(5001), new ExposedPort(5001))
+                            )
+                        );
+                    })
+                    .waitingFor(Wait.forHttp("/health").forPort(5001));
+            this.doclingContainer.start();
+            LOG.info("[bake-image] Docling Serve started at: http://localhost:5001");
+
+            // 2) Start pgvector container
+            LOG.info("=== Starting pgvector container ===");
+            this.pgContainer = new PostgreSQLContainer<>(DockerImageName.parse(this.baseImageRef))
                     .withDatabaseName(DB_NAME)
                     .withUsername("postgres")
                     .withPassword("postgres");
-            this.container.start();
+            this.pgContainer.start();
 
-            String jdbcUrl = this.container.getJdbcUrl();
-            String user = this.container.getUsername();
-            String pass = this.container.getPassword();
-            LOG.infof("[bake-image] Started: %s id=%s", this.baseImageRef, this.container.getContainerId());
+            String jdbcUrl = this.pgContainer.getJdbcUrl();
+            String user = this.pgContainer.getUsername();
+            String pass = this.pgContainer.getPassword();
+            LOG.infof("[bake-image] PGVector started: %s", jdbcUrl);
 
-            // 2) Setup embedding store and model
+            // 3) Setup embedding store and model
             LOG.info("=== Setting up embedding infrastructure ===");
-            int embeddingDimensions = getDim();
             DataSource ds = makeDataSource(jdbcUrl, user, pass);
 
             PgVectorEmbeddingStore store = PgVectorEmbeddingStore.datasourceBuilder()
                     .datasource(ds)
                     .table("rag_documents")
-                    .dimension(embeddingDimensions)
+                    .dimension(EMBEDDING_DIMENSIONS)
                     .useIndex(true)
                     .indexListSize(100)
                     .build();
@@ -157,40 +188,142 @@ public class BakeImageCommand implements Runnable {
                     .documentSplitter(splitter)
                     .build();
 
-            // 3) Fetch guide URLs
-            LOG.info("=== Fetching Quarkus guide URLs ===");
-            QuarkusDocsFetcher fetcher = new QuarkusDocsFetcher();
-            List<String> guideUrls = fetcher.fetchGuideUrls(quarkusVersion);
+            // 4) Clone Quarkus repository for AsciiDoc metadata extraction
+            LOG.info("=== Cloning Quarkus repository ===");
+            Path quarkusRepoDir = null;
+            try {
+                quarkusRepoDir = Files.createTempDirectory("quarkus-repo-");
+                LOG.infof("[bake-image] Cloning quarkusio/quarkus to: %s", quarkusRepoDir);
 
-            if (maxGuides > 0 && guideUrls.size() > maxGuides) {
-                LOG.infof("[bake-image] Limiting to first %d guides (out of %d)", maxGuides, guideUrls.size());
-                guideUrls = guideUrls.subList(0, maxGuides);
+                Git git = Git.cloneRepository()
+                        .setURI("https://github.com/quarkusio/quarkus.git")
+                        .setDirectory(quarkusRepoDir.toFile())
+                        .setBranch("refs/tags/" + quarkusVersion)
+                        .setDepth(1)  // Shallow clone for faster download
+                        .call();
+                git.close();
+
+                LOG.infof("[bake-image] Cloned Quarkus %s successfully", quarkusVersion);
+            } catch (GitAPIException e) {
+                LOG.errorf(e, "[bake-image] Failed to clone Quarkus repository at tag %s", quarkusVersion);
+                throw new RuntimeException("Git clone failed", e);
+            }
+            final Path quarkusRepo = quarkusRepoDir;  // Make effectively final for lambda
+
+            // 5) List all AsciiDoc files from cloned repository
+            LOG.info("=== Finding AsciiDoc guides in cloned repository ===");
+            Path docsDir = quarkusRepo.resolve("docs/src/main/asciidoc");
+            List<Path> adocFiles = new ArrayList<>();
+
+            try (var stream = Files.walk(docsDir)) {
+                stream.filter(Files::isRegularFile)
+                     .filter(p -> p.getFileName().toString().endsWith(".adoc"))
+                     .filter(p -> !p.getFileName().toString().startsWith("_"))  // Exclude includes
+                     .filter(p -> !p.toString().contains("/includes/"))  // Exclude includes directory
+                     .filter(p -> !p.toString().contains("/_includes/"))  // Exclude _includes directory
+                     .filter(p -> !p.toString().contains("/_templates/"))  // Exclude _templates directory
+                     .forEach(adocFiles::add);
             }
 
-            LOG.infof("[bake-image] Found %d guides to process", guideUrls.size());
+            adocFiles.sort(Comparator.comparing(Path::toString));
 
-            // 4) Process each guide with Docling
-            LOG.info("=== Processing guides with Docling ===");
-            DoclingConverter converter = new DoclingConverter(doclingService);
+            if (maxGuides > 0 && adocFiles.size() > maxGuides) {
+                LOG.infof("[bake-image] Limiting to first %d guides (out of %d)", maxGuides, adocFiles.size());
+                adocFiles = adocFiles.subList(0, maxGuides);
+            }
+
+            LOG.infof("[bake-image] Found %d AsciiDoc guides to process", adocFiles.size());
+
+            // 6) Determine version string for HTML URLs (e.g., "3.15" from "3.15.0")
+            String versionForUrl = quarkusVersion;
+            if (versionForUrl.matches("\\d+\\.\\d+\\.\\d+")) {
+                // Extract major.minor from major.minor.patch
+                versionForUrl = versionForUrl.substring(0, versionForUrl.lastIndexOf('.'));
+            }
+            LOG.infof("[bake-image] Using version %s for HTML URLs", versionForUrl);
+
+            // 7) Process each guide: Fetch HTML from quarkus.io → Docling → Markdown + AsciiDoc metadata
+            LOG.info("=== Processing guides with hybrid approach ===");
             int processed = 0;
-            int total = guideUrls.size();
+            int total = adocFiles.size();
 
-            for (String url : guideUrls) {
+            for (Path adocPath : adocFiles) {
                 try {
-                    // Convert HTML to Markdown using Docling
-                    String markdown = converter.convertUrlToMarkdown(url);
-
-                    // Extract metadata
+                    // Extract metadata from AsciiDoc file
                     Metadata metadata = new Metadata();
-                    metadata.put("url", url);
                     metadata.put("quarkus_version", quarkusVersion);
 
-                    // Extract title from URL (last segment)
-                    String title = extractTitleFromUrl(url);
+                    // Set repo_path (relative path from repo root)
+                    String repoPath = quarkusRepo.relativize(adocPath).toString();
+                    metadata.put("repo_path", repoPath);
+
+                    // Extract title from filename
+                    String fileName = adocPath.getFileName().toString();
+                    String title = fileName.substring(0, fileName.lastIndexOf('.'));
                     metadata.put("title", title);
 
-                    // Create document and ingest
-                    Document doc = Document.from(markdown, metadata);
+                    // Extract AsciiDoc metadata (topics, categories, extensions, summary)
+                    Map<String, String> adocMeta = AsciiDocMetadataExtractor.extractMetadata(adocPath);
+
+                    // Add topics (most important for matching!)
+                    String topics = adocMeta.get("topics");
+                    if (topics != null && !topics.isEmpty()) {
+                        metadata.put("topics", topics);
+                        LOG.debugf("[bake-image] %s has topics: %s", title, topics);
+                    }
+
+                    // Add categories
+                    String categories = adocMeta.get("categories");
+                    if (categories != null && !categories.isEmpty()) {
+                        metadata.put("categories", categories);
+                    }
+
+                    // Add extensions
+                    String extensions = adocMeta.get("extensions");
+                    if (extensions != null && !extensions.isEmpty()) {
+                        metadata.put("extensions", extensions);
+                    }
+
+                    // Add summary
+                    String summary = adocMeta.get("summary");
+                    if (summary != null && !summary.isEmpty()) {
+                        metadata.put("summary", summary);
+                    }
+
+                    // Build versioned HTML URL
+                    String htmlUrl = "https://quarkus.io/version/" + versionForUrl + "/guides/" + title;
+
+                    // Use Docling to fetch and convert HTML from quarkus.io to Markdown
+                    // Try versioned URL first, fallback to latest if it fails
+                    ConvertDocumentResponse resp = null;
+                    String actualUrl = htmlUrl;
+                    try {
+                        URI htmlUri = URI.create(htmlUrl);
+                        resp = doclingService.convertFromUri(htmlUri, OutputFormat.MARKDOWN);
+                        LOG.infof("[bake-image] Fetched versioned URL: %s", htmlUrl);
+                    } catch (Exception e) {
+                        // Fallback to latest (non-versioned) URL
+                        String latestUrl = "https://quarkus.io/guides/" + title;
+                        LOG.warnf("[bake-image] Versioned URL failed (%s), trying latest URL: %s",
+                                  e.getMessage(), latestUrl);
+                        try {
+                            URI latestUri = URI.create(latestUrl);
+                            resp = doclingService.convertFromUri(latestUri, OutputFormat.MARKDOWN);
+                            actualUrl = latestUrl;
+                            LOG.infof("[bake-image] Successfully fetched latest URL: %s", latestUrl);
+                        } catch (Exception fallbackEx) {
+                            // Both URLs failed, re-throw to be caught by outer exception handler
+                            LOG.errorf(fallbackEx, "[bake-image] Both versioned and latest URLs failed for %s", title);
+                            throw fallbackEx;
+                        }
+                    }
+
+                    String markdownContent = resp.getDocument().getMarkdownContent();
+                    metadata.put("url", actualUrl);
+                    LOG.infof("[bake-image] Converted %s -> %d chars", actualUrl, markdownContent.length());
+
+                    // Create document and ingest (using Docling-converted Markdown content + AsciiDoc metadata)
+                    Document doc = Document.from(markdownContent, metadata);
                     ingestor.ingest(doc);
 
                     processed++;
@@ -198,13 +331,13 @@ public class BakeImageCommand implements Runnable {
                         LOG.infof("[bake-image] Processed %d / %d guides", processed, total);
                     }
                 } catch (Exception e) {
-                    LOG.errorf(e, "[bake-image] Failed to process %s - skipping", url);
+                    LOG.errorf(e, "[bake-image] Failed to process %s - skipping", adocPath);
                 }
             }
 
             LOG.infof("[bake-image] Successfully ingested %d / %d guides", processed, total);
 
-            // 5) Dump database to SQL
+            // 6) Dump database to SQL
             LOG.info("=== Dumping database ===");
             workDir = Files.createTempDirectory("rag-bake-" + System.nanoTime());
             Path initDir = Files.createDirectories(workDir.resolve("init"));
@@ -212,10 +345,10 @@ public class BakeImageCommand implements Runnable {
 
             // Dump inside container to /tmp/rag.sql then copy to host
             String inside = "/tmp/rag.sql";
-            var result = this.container.execInContainer(
+            var result = this.pgContainer.execInContainer(
                     "bash", "-lc",
-                    "PGPASSWORD=" + this.container.getPassword() +
-                            " pg_dump -U " + this.container.getUsername() +
+                    "PGPASSWORD=" + this.pgContainer.getPassword() +
+                            " pg_dump -U " + this.pgContainer.getUsername() +
                             " -d " + DB_NAME +
                             " --no-owner --no-privileges --format=plain -f " + inside
             );
@@ -224,10 +357,10 @@ public class BakeImageCommand implements Runnable {
                 throw new IllegalStateException("pg_dump failed: " + result.getStderr());
             }
 
-            this.container.copyFileFromContainer(inside, dump.toString());
+            this.pgContainer.copyFileFromContainer(inside, dump.toString());
             LOG.infof("[bake-image] Dumped SQL -> %s", dump);
 
-            // 6) Build and push the image with Jib
+            // 7) Build and push the image with Jib
             LOG.info("=== Building Docker image ===");
             FileEntriesLayer initLayer = FileEntriesLayer.builder()
                     .setName("initdb-sql")
@@ -270,12 +403,20 @@ public class BakeImageCommand implements Runnable {
             throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
         } finally {
             // Cleanup
-            if (container != null) {
-                LOG.info("[bake-image] Stopping container");
+            if (doclingContainer != null) {
+                LOG.info("[bake-image] Stopping Docling container");
                 try {
-                    container.stop();
+                    doclingContainer.stop();
                 } catch (Throwable t) {
-                    LOG.warn("Failed to stop container", t);
+                    LOG.warn("Failed to stop Docling container", t);
+                }
+            }
+            if (pgContainer != null) {
+                LOG.info("[bake-image] Stopping PGVector container");
+                try {
+                    pgContainer.stop();
+                } catch (Throwable t) {
+                    LOG.warn("Failed to stop PGVector container", t);
                 }
             }
             if (workDir != null) {
@@ -298,14 +439,7 @@ public class BakeImageCommand implements Runnable {
         return ds;
     }
 
-    private int getDim() {
-        Config c = ConfigProvider.getConfig();
-        return c.getValue("quarkus.langchain4j.pgvector.dimension", Integer.class);
-    }
-
     private static String extractTitleFromUrl(String url) {
-        // Extract title from URL like "https://quarkus.io/version/3.30/guides/kafka"
-        // Returns "kafka"
         String[] parts = url.split("/");
         if (parts.length > 0) {
             String last = parts[parts.length - 1];

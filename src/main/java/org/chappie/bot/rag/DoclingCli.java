@@ -9,7 +9,7 @@ import picocli.CommandLine.Command;
     name = "docling-rag",
     mixinStandardHelpOptions = true,
     subcommands = {
-        StandaloneBakeImageCommand.class
+        BakeImageCommand.class
     },
     description = "Docling-based RAG helper CLI for Quarkus docs"
 )
