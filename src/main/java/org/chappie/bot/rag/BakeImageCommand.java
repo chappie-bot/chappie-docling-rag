@@ -16,14 +16,8 @@ import javax.sql.DataSource;
 
 import org.jboss.logging.Logger;
 import org.postgresql.ds.PGSimpleDataSource;
-import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
-import com.github.dockerjava.api.model.ExposedPort;
-import com.github.dockerjava.api.model.HostConfig;
-import com.github.dockerjava.api.model.PortBinding;
-import com.github.dockerjava.api.model.Ports;
 
 import com.google.cloud.tools.jib.api.Containerizer;
 import com.google.cloud.tools.jib.api.DockerDaemonImage;
@@ -36,6 +30,8 @@ import com.google.cloud.tools.jib.api.buildplan.Platform;
 
 import ai.docling.serve.api.convert.request.options.OutputFormat;
 import ai.docling.serve.api.convert.response.ConvertDocumentResponse;
+import ai.docling.testcontainers.serve.DoclingServeContainer;
+import ai.docling.testcontainers.serve.config.DoclingServeContainerConfig;
 import io.quarkiverse.docling.runtime.client.DoclingService;
 import jakarta.inject.Inject;
 import dev.langchain4j.data.document.Document;
@@ -118,9 +114,6 @@ public class BakeImageCommand implements Runnable {
     @Inject
     DoclingService doclingService;
 
-    private PostgreSQLContainer<?> pgContainer;
-    private GenericContainer<?> doclingContainer;
-
     @Override
     public void run() {
         long t0 = System.nanoTime();
@@ -130,33 +123,28 @@ public class BakeImageCommand implements Runnable {
                   chunkSize, chunkOverlap, semanticChunking);
 
         Path workDir = null;
-        try {
+        try (var doclingContainer = new DoclingServeContainer(
+            DoclingServeContainerConfig.builder()
+                .image(DOCLING_IMAGE)
+                .build());
+             var pgContainer = new PostgreSQLContainer<>(DockerImageName.parse(this.baseImageRef))
+                 .withDatabaseName(DB_NAME)
+                 .withUsername("postgres")
+                 .withPassword("postgres")) {
+
             // 1) Start Docling Serve container on fixed port 5001
             LOG.info("=== Starting Docling Serve container ===");
-            this.doclingContainer = new GenericContainer<>(DockerImageName.parse(DOCLING_IMAGE))
-                    .withExposedPorts(5001)
-                    .withCreateContainerCmdModifier(cmd -> {
-                        cmd.withHostConfig(
-                            new HostConfig().withPortBindings(
-                                new PortBinding(Ports.Binding.bindPort(5001), new ExposedPort(5001))
-                            )
-                        );
-                    })
-                    .waitingFor(Wait.forHttp("/health").forPort(5001));
-            this.doclingContainer.start();
-            LOG.info("[bake-image] Docling Serve started at: http://localhost:5001");
+            doclingContainer.setPortBindings(List.of("%d:%d".formatted(DoclingServeContainer.DEFAULT_DOCLING_PORT, DoclingServeContainer.DEFAULT_DOCLING_PORT)));
+            doclingContainer.start();
+            LOG.infof("[bake-image] Docling Serve started at: %s", doclingContainer.getApiUrl());
 
             // 2) Start pgvector container
             LOG.info("=== Starting pgvector container ===");
-            this.pgContainer = new PostgreSQLContainer<>(DockerImageName.parse(this.baseImageRef))
-                    .withDatabaseName(DB_NAME)
-                    .withUsername("postgres")
-                    .withPassword("postgres");
-            this.pgContainer.start();
+            pgContainer.start();
 
-            String jdbcUrl = this.pgContainer.getJdbcUrl();
-            String user = this.pgContainer.getUsername();
-            String pass = this.pgContainer.getPassword();
+            String jdbcUrl = pgContainer.getJdbcUrl();
+            String user = pgContainer.getUsername();
+            String pass = pgContainer.getPassword();
             LOG.infof("[bake-image] PGVector started: %s", jdbcUrl);
 
             // 3) Setup embedding store and model
@@ -345,10 +333,10 @@ public class BakeImageCommand implements Runnable {
 
             // Dump inside container to /tmp/rag.sql then copy to host
             String inside = "/tmp/rag.sql";
-            var result = this.pgContainer.execInContainer(
+            var result = pgContainer.execInContainer(
                     "bash", "-lc",
-                    "PGPASSWORD=" + this.pgContainer.getPassword() +
-                            " pg_dump -U " + this.pgContainer.getUsername() +
+                    "PGPASSWORD=" + pgContainer.getPassword() +
+                            " pg_dump -U " + pgContainer.getUsername() +
                             " -d " + DB_NAME +
                             " --no-owner --no-privileges --format=plain -f " + inside
             );
@@ -357,7 +345,7 @@ public class BakeImageCommand implements Runnable {
                 throw new IllegalStateException("pg_dump failed: " + result.getStderr());
             }
 
-            this.pgContainer.copyFileFromContainer(inside, dump.toString());
+            pgContainer.copyFileFromContainer(inside, dump.toString());
             LOG.infof("[bake-image] Dumped SQL -> %s", dump);
 
             // 7) Build and push the image with Jib
@@ -403,22 +391,6 @@ public class BakeImageCommand implements Runnable {
             throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
         } finally {
             // Cleanup
-            if (doclingContainer != null) {
-                LOG.info("[bake-image] Stopping Docling container");
-                try {
-                    doclingContainer.stop();
-                } catch (Throwable t) {
-                    LOG.warn("Failed to stop Docling container", t);
-                }
-            }
-            if (pgContainer != null) {
-                LOG.info("[bake-image] Stopping PGVector container");
-                try {
-                    pgContainer.stop();
-                } catch (Throwable t) {
-                    LOG.warn("Failed to stop PGVector container", t);
-                }
-            }
             if (workDir != null) {
                 try {
                     deleteRecursive(workDir);

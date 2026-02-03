@@ -44,6 +44,11 @@
             <artifactId>quarkus-docling</artifactId>
             <version>1.2.2</version>
         </dependency>
+	    <dependency>
+				    <groupId>ai.docling</groupId>
+				    <artifactId>docling-testcontainers</artifactId>
+				    <version>0.4.4</version>
+	    </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-rest-jackson</artifactId>
