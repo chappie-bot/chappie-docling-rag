@@ -97,7 +97,8 @@ public class MarkdownSemanticSplitter implements DocumentSplitter {
         // Build section hierarchy
         for (int i = 0; i < headers.size(); i++) {
             HeaderMatch current = headers.get(i);
-            int contentStart = text.indexOf('\n', current.position) + 1;
+            int newlinePos = text.indexOf('\n', current.position);
+            int contentStart = (newlinePos >= 0) ? newlinePos + 1 : text.length();
             int contentEnd = (i + 1 < headers.size()) ? headers.get(i + 1).position : text.length();
 
             String content = text.substring(contentStart, contentEnd).trim();
@@ -228,10 +229,12 @@ public class MarkdownSemanticSplitter implements DocumentSplitter {
         return new Metadata(metadata);
     }
 
+    /**
+     * Cross-section overlap is not applied for semantic splitting because sections are
+     * naturally related through hierarchical header paths. The chunkOverlap parameter
+     * only takes effect when the fallback recursive splitter is used for oversized sections.
+     */
     private List<TextSegment> addCrossSectionOverlap(List<TextSegment> chunks, List<Section> sections) {
-        // For simplicity, we'll skip cross-section overlap for now
-        // since sections are naturally related through headers
-        // This could be enhanced later if needed
         return chunks;
     }
 
