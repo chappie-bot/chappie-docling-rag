@@ -10,6 +10,8 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.jboss.logging.Logger;
+
 /**
  * Extracts metadata from AsciiDoc file headers.
  * Reads the first ~120 lines looking for attribute definitions like:
@@ -19,6 +21,8 @@ import java.util.regex.Pattern;
  * :summary: This guide explains...
  */
 public class AsciiDocMetadataExtractor {
+
+    private static final Logger LOG = Logger.getLogger(AsciiDocMetadataExtractor.class);
 
     private static final Pattern ATTR_PATTERN =
         Pattern.compile("^\\s*:(categories|summary|extensions|topics):\\s*(.*)\\s*$");
@@ -60,7 +64,7 @@ public class AsciiDocMetadataExtractor {
                 }
             }
         } catch (IOException e) {
-            // Ignore - return empty metadata
+            LOG.warnf("Failed to read AsciiDoc metadata from %s: %s", adocPath, e.getMessage());
         }
 
         return metadata;

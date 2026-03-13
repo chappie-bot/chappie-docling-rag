@@ -130,6 +130,7 @@ public class BakeImageCommand implements Runnable {
                   chunkSize, chunkOverlap, semanticChunking);
 
         Path workDir = null;
+        Path quarkusRepoDir = null;
         try {
             // 1) Start Docling Serve container on fixed port 5001
             LOG.info("=== Starting Docling Serve container ===");
@@ -190,20 +191,18 @@ public class BakeImageCommand implements Runnable {
 
             // 4) Clone Quarkus repository for AsciiDoc metadata extraction
             LOG.info("=== Cloning Quarkus repository ===");
-            Path quarkusRepoDir = null;
             try {
                 quarkusRepoDir = Files.createTempDirectory("quarkus-repo-");
                 LOG.infof("[bake-image] Cloning quarkusio/quarkus to: %s", quarkusRepoDir);
 
-                Git git = Git.cloneRepository()
+                try (Git git = Git.cloneRepository()
                         .setURI("https://github.com/quarkusio/quarkus.git")
                         .setDirectory(quarkusRepoDir.toFile())
                         .setBranch("refs/tags/" + quarkusVersion)
                         .setDepth(1)  // Shallow clone for faster download
-                        .call();
-                git.close();
-
-                LOG.infof("[bake-image] Cloned Quarkus %s successfully", quarkusVersion);
+                        .call()) {
+                    LOG.infof("[bake-image] Cloned Quarkus %s successfully", quarkusVersion);
+                }
             } catch (GitAPIException e) {
                 LOG.errorf(e, "[bake-image] Failed to clone Quarkus repository at tag %s", quarkusVersion);
                 throw new RuntimeException("Git clone failed", e);
@@ -335,7 +334,11 @@ public class BakeImageCommand implements Runnable {
                 }
             }
 
+            int failed = total - processed;
             LOG.infof("[bake-image] Successfully ingested %d / %d guides", processed, total);
+            if (failed > 0) {
+                LOG.warnf("[bake-image] %d guide(s) failed to process — RAG database is incomplete", failed);
+            }
 
             // 6) Dump database to SQL
             LOG.info("=== Dumping database ===");
@@ -346,11 +349,12 @@ public class BakeImageCommand implements Runnable {
             // Dump inside container to /tmp/rag.sql then copy to host
             String inside = "/tmp/rag.sql";
             var result = this.pgContainer.execInContainer(
-                    "bash", "-lc",
-                    "PGPASSWORD=" + this.pgContainer.getPassword() +
-                            " pg_dump -U " + this.pgContainer.getUsername() +
-                            " -d " + DB_NAME +
-                            " --no-owner --no-privileges --format=plain -f " + inside
+                    "env", "PGPASSWORD=" + this.pgContainer.getPassword(),
+                    "pg_dump",
+                    "-U", this.pgContainer.getUsername(),
+                    "-d", DB_NAME,
+                    "--no-owner", "--no-privileges", "--format=plain",
+                    "-f", inside
             );
 
             if (result.getExitCode() != 0) {
@@ -419,6 +423,12 @@ public class BakeImageCommand implements Runnable {
                     LOG.warn("Failed to stop PGVector container", t);
                 }
             }
+            if (quarkusRepoDir != null) {
+                try {
+                    deleteRecursive(quarkusRepoDir);
+                } catch (Throwable ignore) {
+                }
+            }
             if (workDir != null) {
                 try {
                     deleteRecursive(workDir);
@@ -437,15 +447,6 @@ public class BakeImageCommand implements Runnable {
         ds.setUser(user);
         ds.setPassword(pass);
         return ds;
-    }
-
-    private static String extractTitleFromUrl(String url) {
-        String[] parts = url.split("/");
-        if (parts.length > 0) {
-            String last = parts[parts.length - 1];
-            return last.isEmpty() && parts.length > 1 ? parts[parts.length - 2] : last;
-        }
-        return "unknown";
     }
 
     private static void deleteRecursive(Path root) throws IOException {
